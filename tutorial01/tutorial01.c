@@ -26,6 +26,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 
 #include <stdio.h>
 
@@ -76,8 +77,7 @@ int main(int argc, char *argv[]) {
     printf("Please provide a movie file\n");
     return -1;
   }
-  // Register all formats and codecs
-  av_register_all();
+  // Register all formats and codecs (not needed in FFmpeg >= 4.0)
   
   // Open video file
   if(avformat_open_input(&pFormatCtx, argv[1], NULL, NULL)!=0)
@@ -91,105 +91,104 @@ int main(int argc, char *argv[]) {
   av_dump_format(pFormatCtx, 0, argv[1], 0);
   
   // Find the first video stream
-  videoStream=-1;
-  for(i=0; i<pFormatCtx->nb_streams; i++)
-    if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO) {
-      videoStream=i;
+  videoStream = -1;
+  for (i = 0; i < pFormatCtx->nb_streams; i++) {
+    if (pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+      videoStream = i;
       break;
     }
-  if(videoStream==-1)
+  }
+  if (videoStream == -1)
     return -1; // Didn't find a video stream
-  
-  // Get a pointer to the codec context for the video stream
-  pCodecCtxOrig=pFormatCtx->streams[videoStream]->codec;
+
   // Find the decoder for the video stream
-  pCodec=avcodec_find_decoder(pCodecCtxOrig->codec_id);
-  if(pCodec==NULL) {
+  AVCodecParameters *codecpar = pFormatCtx->streams[videoStream]->codecpar;
+  pCodec = avcodec_find_decoder(codecpar->codec_id);
+  if (pCodec == NULL) {
     fprintf(stderr, "Unsupported codec!\n");
     return -1; // Codec not found
   }
-  // Copy context
+  // Allocate a codec context for the decoder
   pCodecCtx = avcodec_alloc_context3(pCodec);
-  if(avcodec_copy_context(pCodecCtx, pCodecCtxOrig) != 0) {
-    fprintf(stderr, "Couldn't copy codec context");
-    return -1; // Error copying codec context
+  if (!pCodecCtx) {
+    fprintf(stderr, "Could not allocate video codec context\n");
+    return -1;
+  }
+  // Copy codec parameters from input stream to output codec context
+  if (avcodec_parameters_to_context(pCodecCtx, codecpar) < 0) {
+    fprintf(stderr, "Failed to copy codec parameters to decoder context\n");
+    return -1;
   }
 
   // Open codec
-  if(avcodec_open2(pCodecCtx, pCodec, NULL)<0)
+  if (avcodec_open2(pCodecCtx, pCodec, NULL) < 0)
     return -1; // Could not open codec
-  
+
   // Allocate video frame
-  pFrame=av_frame_alloc();
-  
-  // Allocate an AVFrame structure
-  pFrameRGB=av_frame_alloc();
-  if(pFrameRGB==NULL)
+  pFrame = av_frame_alloc();
+
+  // Allocate an AVFrame structure for RGB
+  pFrameRGB = av_frame_alloc();
+  if (pFrameRGB == NULL)
     return -1;
 
   // Determine required buffer size and allocate buffer
-  numBytes=avpicture_get_size(PIX_FMT_RGB24, pCodecCtx->width,
-			      pCodecCtx->height);
-  buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
-  
+  numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, pCodecCtx->width,
+                                      pCodecCtx->height, 1);
+  buffer = (uint8_t *)av_malloc(numBytes * sizeof(uint8_t));
+
   // Assign appropriate parts of buffer to image planes in pFrameRGB
-  // Note that pFrameRGB is an AVFrame, but AVFrame is a superset
-  // of AVPicture
-  avpicture_fill((AVPicture *)pFrameRGB, buffer, PIX_FMT_RGB24,
-		 pCodecCtx->width, pCodecCtx->height);
-  
+  av_image_fill_arrays(pFrameRGB->data, pFrameRGB->linesize, buffer, AV_PIX_FMT_RGB24,
+                      pCodecCtx->width, pCodecCtx->height, 1);
+
   // initialize SWS context for software scaling
   sws_ctx = sws_getContext(pCodecCtx->width,
-			   pCodecCtx->height,
-			   pCodecCtx->pix_fmt,
-			   pCodecCtx->width,
-			   pCodecCtx->height,
-			   PIX_FMT_RGB24,
-			   SWS_BILINEAR,
-			   NULL,
-			   NULL,
-			   NULL
-			   );
+                           pCodecCtx->height,
+                           pCodecCtx->pix_fmt,
+                           pCodecCtx->width,
+                           pCodecCtx->height,
+                           AV_PIX_FMT_RGB24,
+                           SWS_BILINEAR,
+                           NULL,
+                           NULL,
+                           NULL);
 
   // Read frames and save first five frames to disk
-  i=0;
-  while(av_read_frame(pFormatCtx, &packet)>=0) {
+  i = 0;
+  while (av_read_frame(pFormatCtx, &packet) >= 0) {
     // Is this a packet from the video stream?
-    if(packet.stream_index==videoStream) {
-      // Decode video frame
-      avcodec_decode_video2(pCodecCtx, pFrame, &frameFinished, &packet);
-      
-      // Did we get a video frame?
-      if(frameFinished) {
-	// Convert the image from its native format to RGB
-	sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
-		  pFrame->linesize, 0, pCodecCtx->height,
-		  pFrameRGB->data, pFrameRGB->linesize);
-	
-	// Save the frame to disk
-	if(++i<=5)
-	  SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, 
-		    i);
+    if (packet.stream_index == videoStream) {
+      // Send the packet to the decoder
+      if (avcodec_send_packet(pCodecCtx, &packet) == 0) {
+        // Read all the output frames (in general there may be more than one)
+        while (avcodec_receive_frame(pCodecCtx, pFrame) == 0) {
+          // Convert the image from its native format to RGB
+          sws_scale(sws_ctx, (uint8_t const * const *)pFrame->data,
+                    pFrame->linesize, 0, pCodecCtx->height,
+                    pFrameRGB->data, pFrameRGB->linesize);
+
+          // Save the frame to disk
+          if (++i <= 5)
+            SaveFrame(pFrameRGB, pCodecCtx->width, pCodecCtx->height, i);
+        }
       }
     }
-    
     // Free the packet that was allocated by av_read_frame
-    av_free_packet(&packet);
+    av_packet_unref(&packet);
   }
   
   // Free the RGB image
   av_free(buffer);
   av_frame_free(&pFrameRGB);
-  
+
   // Free the YUV frame
   av_frame_free(&pFrame);
-  
-  // Close the codecs
-  avcodec_close(pCodecCtx);
-  avcodec_close(pCodecCtxOrig);
+
+  // Close the codec context
+  avcodec_free_context(&pCodecCtx);
 
   // Close the video file
   avformat_close_input(&pFormatCtx);
-  
+
   return 0;
 }

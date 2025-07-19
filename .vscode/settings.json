@@ -1,5 +1,7 @@
 {
     "files.associations": {
-        "avcodec.h": "c"
+        "avcodec.h": "c",
+        "swscale.h": "c",
+        "imgutils.h": "c"
     }
 }
