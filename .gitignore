@@ -2,6 +2,6 @@
 *.plist
 *.yml
 
-tutorial01/tutorial01
+tutorial0*/tutorial0*
 *.dSYM
 *.ppm
