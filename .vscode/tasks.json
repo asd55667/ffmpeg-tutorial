@@ -1,0 +1,32 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build ffplay",
+            "type": "shell",
+            "command": "clang",
+            "args": [
+                "-g",
+                "${file}",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}",
+                "-I/opt/homebrew/Cellar/ffmpeg/7.1_3/include",
+                "-L/opt/homebrew/Cellar/ffmpeg/7.1_3/lib",
+                "-I/opt/homebrew/Cellar/sdl2/2.30.8/include",
+                "-L/opt/homebrew/Cellar/sdl2/2.30.8/lib",
+                "-lavcodec",
+                "-lavformat",
+                "-lavutil",
+                "-lswscale",
+                "-lavdevice",
+                "-lswresample",
+                "-lsdl2"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}
