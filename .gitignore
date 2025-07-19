@@ -1,0 +1,6 @@
+.DStore
+*.plist
+*.yml
+
+tutorial01/tutorial01
+*.dSYM
