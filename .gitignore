@@ -1,6 +1,7 @@
-.DStore
+.DS_Store
 *.plist
 *.yml
 
 tutorial01/tutorial01
 *.dSYM
+*.ppm
