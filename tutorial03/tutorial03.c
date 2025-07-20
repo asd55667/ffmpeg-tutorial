@@ -27,7 +27,9 @@
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+
 #include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
 
 #include <SDL2/SDL.h>
 
@@ -109,12 +111,18 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block) {
     return ret;
 }
 
+// SwrContext for audio resampling
+static SwrContext *swr_ctx = NULL;
+static enum AVSampleFormat out_sample_fmt = AV_SAMPLE_FMT_S16;
+static int out_channels = 0;
+static int out_sample_rate = 0;
+static AVChannelLayout out_ch_layout;
+
 int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_size) {
     static AVPacket pkt;
     static int pkt_in_use = 0;
     static AVFrame *frame = NULL;
-    int data_size = 0;
-    int ret;
+    int ret, data_size = 0;
     if (!frame) frame = av_frame_alloc();
     while (1) {
         if (!pkt_in_use) {
@@ -138,9 +146,38 @@ int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_si
                 av_packet_unref(&pkt);
                 return -1;
             }
-            data_size = av_samples_get_buffer_size(NULL, aCodecCtx->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
-            if (data_size > buf_size) data_size = buf_size;
-            memcpy(audio_buf, frame->data[0], data_size);
+            // Resample if needed
+            if (swr_ctx) {
+                int dst_nb_samples = av_rescale_rnd(
+                    swr_get_delay(swr_ctx, aCodecCtx->sample_rate) + frame->nb_samples,
+                    out_sample_rate, aCodecCtx->sample_rate, AV_ROUND_UP);
+                int out_linesize;
+                uint8_t *out_buf[2] = { audio_buf, NULL };
+                int out_buf_size = av_samples_get_buffer_size(&out_linesize, out_channels, dst_nb_samples, out_sample_fmt, 1);
+                if (out_buf_size < 0) {
+                    pkt_in_use = 0;
+                    av_packet_unref(&pkt);
+                    return -1;
+                }
+                int samples_converted = swr_convert(
+                    swr_ctx,
+                    out_buf,
+                    dst_nb_samples,
+                    (const uint8_t **)frame->data,
+                    frame->nb_samples);
+                if (samples_converted < 0) {
+                    pkt_in_use = 0;
+                    av_packet_unref(&pkt);
+                    return -1;
+                }
+                data_size = samples_converted * out_channels * av_get_bytes_per_sample(out_sample_fmt);
+                if (data_size > buf_size) data_size = buf_size;
+            } else {
+                // fallback: no resample
+                data_size = av_samples_get_buffer_size(NULL, aCodecCtx->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
+                if (data_size > buf_size) data_size = buf_size;
+                memcpy(audio_buf, frame->data[0], data_size);
+            }
             pkt_in_use = 0;
             av_packet_unref(&pkt);
             return data_size;
@@ -178,16 +215,17 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 
+
 int main(int argc, char *argv[]) {
     AVFormatContext *pFormatCtx = NULL;
     int i, videoStream = -1, audioStream = -1;
     AVCodecContext *pCodecCtx = NULL;
-    AVCodec *pCodec = NULL;
+    const AVCodec *pCodec = NULL;
     AVFrame *pFrame = NULL;
     AVPacket packet;
     struct SwsContext *sws_ctx = NULL;
     AVCodecContext *aCodecCtx = NULL;
-    AVCodec *aCodec = NULL;
+    const AVCodec *aCodec = NULL;
     SDL_Window *window = NULL;
     SDL_Renderer *renderer = NULL;
     SDL_Texture *texture = NULL;
@@ -238,9 +276,37 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Could not open audio codec!\n");
         return -1;
     }
-    wanted_spec.freq = aCodecCtx->sample_rate;
+
+    // Setup audio resampler for FFmpeg 7.x
+    out_sample_fmt = AV_SAMPLE_FMT_S16;
+    out_sample_rate = aCodecCtx->sample_rate;
+    out_channels = aCodecCtx->ch_layout.nb_channels;
+    av_channel_layout_default(&out_ch_layout, out_channels);
+    swr_ctx = swr_alloc();
+    if (!swr_ctx) {
+        fprintf(stderr, "Could not allocate resampler!\n");
+        return -1;
+    }
+    if (swr_alloc_set_opts2(
+            &swr_ctx,
+            &out_ch_layout,
+            out_sample_fmt,
+            out_sample_rate,
+            &aCodecCtx->ch_layout,
+            aCodecCtx->sample_fmt,
+            aCodecCtx->sample_rate,
+            0, NULL) < 0) {
+        fprintf(stderr, "Could not set resampler options!\n");
+        return -1;
+    }
+    if (swr_init(swr_ctx) < 0) {
+        fprintf(stderr, "Could not initialize resampler!\n");
+        return -1;
+    }
+
+    wanted_spec.freq = out_sample_rate;
     wanted_spec.format = AUDIO_S16SYS;
-    wanted_spec.channels = aCodecCtx->ch_layout.nb_channels;
+    wanted_spec.channels = out_channels;
     wanted_spec.silence = 0;
     wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE;
     wanted_spec.callback = audio_callback;
@@ -317,6 +383,8 @@ int main(int argc, char *argv[]) {
     avcodec_free_context(&pCodecCtx);
     avcodec_free_context(&aCodecCtx);
     avformat_close_input(&pFormatCtx);
+    if (swr_ctx) swr_free(&swr_ctx);
+    av_channel_layout_uninit(&out_ch_layout);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
