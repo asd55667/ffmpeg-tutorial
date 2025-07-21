@@ -507,7 +507,6 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
 }
 
 double synchronize_video(VideoState *is, AVFrame *src_frame, double pts) {
-
   double frame_delay;
 
   if(pts != 0) {
@@ -517,11 +516,13 @@ double synchronize_video(VideoState *is, AVFrame *src_frame, double pts) {
     /* if we aren't given a pts, set it to the clock */
     pts = is->video_clock;
   }
+  
   /* update the video clock */
   frame_delay = av_q2d(is->video_ctx->time_base);
   /* if we are repeating a frame, adjust clock accordingly */
   frame_delay += src_frame->repeat_pict * (frame_delay * 0.5);
   is->video_clock += frame_delay;
+  
   return pts;
 }
 
@@ -531,7 +532,6 @@ int video_thread(void *arg) {
   AVPacket pkt1, *packet = &pkt1;
   AVFrame *pFrame;
   int ret;
-
   double pts;
 
   pFrame = av_frame_alloc();
@@ -541,24 +541,14 @@ int video_thread(void *arg) {
       // means we quit getting packets
       break;
     }
-    if(packet_queue_get(&is->videoq, packet, 1) < 0) {
-      // means we quit getting packets
-      break;
-    }
-    pts = 0;
 
     // Send packet to decoder
     ret = avcodec_send_packet(is->video_ctx, packet);
     if (ret < 0) {
+      fprintf(stderr, "Error sending packet to video decoder: %d\n", ret);
       av_packet_unref(packet);
       continue;
     }
-
-    // TODO:
-    if((pts = pFrame->best_effort_timestamp) == AV_NOPTS_VALUE) {
-      pts = 0;
-    }
-    pts *= av_q2d(is->video_st->time_base);
     
     // Receive frames from decoder
     while (ret >= 0) {
@@ -567,10 +557,23 @@ int video_thread(void *arg) {
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
         break;
       } else if (ret < 0) {
+        fprintf(stderr, "Error receiving frame from video decoder: %d\n", ret);
         break;
       }
 
+      // Get PTS from the frame
+      pts = 0;
+      if(pFrame->best_effort_timestamp != AV_NOPTS_VALUE) {
+        pts = pFrame->best_effort_timestamp;
+      } else if(pFrame->pts != AV_NOPTS_VALUE) {
+        pts = pFrame->pts;
+      } else if(packet->pts != AV_NOPTS_VALUE) {
+        pts = packet->pts;
+      }
+      pts *= av_q2d(is->video_st->time_base);
+
       pts = synchronize_video(is, pFrame, pts);
+      
       // We got a video frame
       if(queue_picture(is, pFrame, pts) < 0) {
         av_packet_unref(packet);
@@ -585,6 +588,15 @@ int video_thread(void *arg) {
   // Send flush packet to get remaining frames
   avcodec_send_packet(is->video_ctx, NULL);
   while (avcodec_receive_frame(is->video_ctx, pFrame) == 0) {
+    pts = 0;
+    if(pFrame->best_effort_timestamp != AV_NOPTS_VALUE) {
+      pts = pFrame->best_effort_timestamp;
+    } else if(pFrame->pts != AV_NOPTS_VALUE) {
+      pts = pFrame->pts;
+    }
+    pts *= av_q2d(is->video_st->time_base);
+    pts = synchronize_video(is, pFrame, pts);
+    
     if(queue_picture(is, pFrame, pts) < 0) {
       break;
     }
@@ -616,6 +628,15 @@ int stream_component_open(VideoState *is, int stream_index) {
   if(avcodec_parameters_to_context(codecCtx, codecpar) != 0) {
     fprintf(stderr, "Couldn't copy codec context");
     return -1;
+  }
+
+  // Set decoder options for better H.264 handling
+  if(codecCtx->codec_type == AVMEDIA_TYPE_VIDEO && codecpar->codec_id == AV_CODEC_ID_H264) {
+    // Enable error concealment for missing reference frames
+    codecCtx->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
+    // Set thread count for better decoding
+    codecCtx->thread_count = 0; // Auto-detect thread count
+    codecCtx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
   }
 
   if(codecCtx->codec_type == AVMEDIA_TYPE_AUDIO) {
