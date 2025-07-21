@@ -2,6 +2,10 @@
     "files.associations": {
         "avcodec.h": "c",
         "swscale.h": "c",
-        "imgutils.h": "c"
+        "imgutils.h": "c",
+        "swresample.h": "c",
+        "sdl.h": "c",
+        "string.h": "c",
+        "avformat.h": "c"
     }
 }
