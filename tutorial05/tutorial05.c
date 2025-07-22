@@ -1,6 +1,5 @@
-// tutorial04.c
-// A pedagogical video player that will stream through every video frame as fast as it can,
-// and play audio (out of sync).
+//  tutorial05.c
+// A pedagogical video player that really works!
 //
 // Code based on FFplay, Copyright (c) 2003 Fabrice Bellard, 
 // and a tutorial by Martin Bohme (boehme@inb.uni-luebeckREMOVETHIS.de)
@@ -9,7 +8,7 @@
 // Use Makefile to build
 //
 // Run using
-// tutorial04 myvideofile.mpv
+// tutorial05 myvideofile.mpv
 //
 // to play the video stream on your screen.
 
