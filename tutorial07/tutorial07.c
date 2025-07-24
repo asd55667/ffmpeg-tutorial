@@ -139,7 +139,7 @@ SDL_mutex       *screen_mutex;
 /* Since we only have one decoding thread, the Big Struct
    can be global in case we need it. */
 VideoState *global_video_state;
-AVPacket flush_pkt;
+AVPacket flush_pkt; // Used as a marker for flushing
 
 void packet_queue_init(PacketQueue *q) {
   q->packets = av_malloc_array(PACKET_QUEUE_CAPACITY, sizeof(AVPacket));
@@ -158,11 +158,18 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
     return -1;
   }
 
-  if(pkt != &flush_pkt && av_dup_packet(pkt) < 0) {
-    return -1;
+  // For flush_pkt, copy the flush marker
+  if(pkt == &flush_pkt) {
+    av_packet_unref(&q->packets[q->rear]);
+    memset(&q->packets[q->rear], 0, sizeof(AVPacket));
+    q->packets[q->rear].data = (uint8_t*)"FLUSH";
+    q->packets[q->rear].size = 5;
+  } else {
+    if (av_packet_ref(&q->packets[q->rear], pkt) < 0) {
+      SDL_UnlockMutex(q->mutex);
+      return -1;
+    }
   }
-
-  av_packet_ref(&q->packets[q->rear], pkt);
   q->rear = (q->rear + 1) % q->capacity;
   q->size++;
   SDL_CondSignal(q->cond);
@@ -196,17 +203,12 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block) {
 }
 
 static void packet_queue_flush(PacketQueue *q) {
-  AVPacketList *pkt, *pkt1;
-
   SDL_LockMutex(q->mutex);
-  for(pkt = q->packets; pkt != NULL; pkt = pkt1) {
-    pkt1 = pkt->next;
-    av_free_packet(&pkt->pkt);
-    av_freep(&pkt);
+  for (int i = 0; i < q->capacity; ++i) {
+    av_packet_unref(&q->packets[i]);
   }
   q->front = 0;
   q->rear = 0;
-  q->size = 0;
   q->size = 0;
   SDL_UnlockMutex(q->mutex);
 }
@@ -252,7 +254,7 @@ double get_master_clock(VideoState *is) {
 /* Add or subtract samples to get a better sync, return new
    audio buffer size */
 int synchronize_audio(VideoState *is, short *samples,
-		      int samples_size, double pts) {
+          int samples_size, double pts) {
   int n;
   double ref_clock;
 
@@ -268,39 +270,39 @@ int synchronize_audio(VideoState *is, short *samples,
     if(diff < AV_NOSYNC_THRESHOLD) {
       // accumulate the diffs
       is->audio_diff_cum = diff + is->audio_diff_avg_coef
-	* is->audio_diff_cum;
+  * is->audio_diff_cum;
       if(is->audio_diff_avg_count < AUDIO_DIFF_AVG_NB) {
-	is->audio_diff_avg_count++;
+  is->audio_diff_avg_count++;
       } else {
-	avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
-	if(fabs(avg_diff) >= is->audio_diff_threshold) {
-	  wanted_size = samples_size + ((int)(diff * is->audio_ctx->sample_rate) * n);
-	  min_size = samples_size * ((100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100);
-	  max_size = samples_size * ((100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100);
-	  if(wanted_size < min_size) {
-	    wanted_size = min_size;
-	  } else if (wanted_size > max_size) {
-	    wanted_size = max_size;
-	  }
-	  if(wanted_size < samples_size) {
-	    /* remove samples */
-	    samples_size = wanted_size;
-	  } else if(wanted_size > samples_size) {
-	    uint8_t *samples_end, *q;
-	    int nb;
+  avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
+  if(fabs(avg_diff) >= is->audio_diff_threshold) {
+    wanted_size = samples_size + ((int)(diff * is->audio_ctx->sample_rate) * n);
+    min_size = samples_size * ((100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+    max_size = samples_size * ((100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100);
+    if(wanted_size < min_size) {
+      wanted_size = min_size;
+    } else if (wanted_size > max_size) {
+      wanted_size = max_size;
+    }
+    if(wanted_size < samples_size) {
+      /* remove samples */
+      samples_size = wanted_size;
+    } else if(wanted_size > samples_size) {
+      uint8_t *samples_end, *q;
+      int nb;
 
-	    /* add samples by copying final sample*/
-	    nb = (samples_size - wanted_size);
-	    samples_end = (uint8_t *)samples + samples_size - n;
-	    q = samples_end + n;
-	    while(nb > 0) {
-	      memcpy(q, samples_end, n);
-	      q += n;
-	      nb -= n;
-	    }
-	    samples_size = wanted_size;
-	  }
-	}
+      /* add samples by copying final sample*/
+      nb = (samples_size - wanted_size);
+      samples_end = (uint8_t *)samples + samples_size - n;
+      q = samples_end + n;
+      while(nb > 0) {
+        memcpy(q, samples_end, n);
+        q += n;
+        nb -= n;
+      }
+      samples_size = wanted_size;
+    }
+  }
       }
     } else {
       /* difference is TOO big; reset diff stuff */
@@ -324,6 +326,14 @@ int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double 
         return -1;
       }
       is->audio_pkt_in_use = 1;
+    }
+
+    // Check for flush packet
+    if(pkt->data && pkt->size == 5 && memcmp(pkt->data, "FLUSH", 5) == 0) {
+      avcodec_flush_buffers(is->audio_ctx);
+      is->audio_pkt_in_use = 0;
+      av_packet_unref(pkt);
+      continue;
     }
 
     ret = avcodec_send_packet(is->audio_ctx, pkt);
@@ -383,10 +393,7 @@ int audio_decode_frame(VideoState *is, uint8_t *audio_buf, int buf_size, double 
       return data_size;
     }
 
-    if(pkt->data == flush_pkt.data) {
-      avcodec_flush_buffers(is->audio_ctx);
-      continue;
-    }
+
 
     is->audio_pkt_in_use = 0;
     av_packet_unref(pkt);
@@ -409,12 +416,12 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
       /* We have already sent all our data; get more */
       audio_size = audio_decode_frame(is, is->audio_buf, sizeof(is->audio_buf), &pts);
       if(audio_size < 0) {
-	/* If error, output silence */
-	is->audio_buf_size = 1024;
-	memset(is->audio_buf, 0, is->audio_buf_size);
+  /* If error, output silence */
+  is->audio_buf_size = 1024;
+  memset(is->audio_buf, 0, is->audio_buf_size);
       } else {
         audio_size = synchronize_audio(is, (int16_t *)is->audio_buf, audio_size, pts);
-	is->audio_buf_size = audio_size;
+  is->audio_buf_size = audio_size;
       }
       is->audio_buf_index = 0;
     }
@@ -520,7 +527,7 @@ void video_refresh_timer(void *userdata) {
       /* update delay to sync to audio if not master source */
       if(is->av_sync_type != AV_SYNC_VIDEO_MASTER) {
         /* update delay to sync to audio */
-  	    ref_clock = get_master_clock(is);
+        ref_clock = get_master_clock(is);
         diff = vp->pts - ref_clock;
 
         /* Skip or repeat the frame. Take delay into account
@@ -681,6 +688,13 @@ int video_thread(void *arg) {
     if(packet_queue_get(&is->videoq, packet, 1) < 0) {
       // means we quit getting packets
       break;
+    }
+
+    // Check if this is a flush packet
+    if(packet->data && packet->size == 5 && memcmp(packet->data, "FLUSH", 5) == 0) {
+      avcodec_flush_buffers(is->video_ctx);
+      av_packet_unref(packet);
+      continue;
     }
 
     // Send packet to decoder
@@ -934,11 +948,11 @@ int decode_thread(void *arg) {
       else if(is->audioStream >= 0) stream_index = is->audioStream;
 
       if (stream_index >= 0) {
-	        seek_target= av_rescale_q(seek_target, AV_TIME_BASE_Q,
-				  pFormatCtx->streams[stream_index]->time_base);
+          seek_target= av_rescale_q(seek_target, AV_TIME_BASE_Q,
+          pFormatCtx->streams[stream_index]->time_base);
       }
       if (av_seek_frame(is->pFormatCtx, stream_index, seek_target, is->seek_flags) < 0) {
-	      fprintf(stderr, "%s: error while seeking\n", is->filename);
+        fprintf(stderr, "%s: error while seeking\n", is->filename);
       } else {
         if(is->audioStream >= 0) {
           packet_queue_flush(&is->audioq);
@@ -948,6 +962,9 @@ int decode_thread(void *arg) {
           packet_queue_flush(&is->videoq);
           packet_queue_put(&is->videoq, &flush_pkt);
         }
+        // Reset timing after seek
+        is->frame_timer = (double)av_gettime_relative() / 1000000.0;
+        is->video_current_pts_time = av_gettime();
       }
       is->seek_req = 0;
     }
@@ -1023,10 +1040,20 @@ int main(int argc, char *argv[]) {
   
   is = av_mallocz(sizeof(VideoState));
   if (!is) {
-    printf("[MAIN] ERROR: Failed to allocate VideoState\n");
-    fflush(stdout);
+    fprintf(stderr, "Could not allocate VideoState\n");
     exit(1);
   }
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
+    fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
+    exit(1);
+  }
+
+  // Create window and renderer
+
+  // Initialize flush_pkt as a marker packet
+  memset(&flush_pkt, 0, sizeof(flush_pkt));
+  flush_pkt.data = (uint8_t*)"FLUSH";
+  flush_pkt.size = 5;
   
   if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
     fprintf(stderr, "Could not initialize SDL - %s\n", SDL_GetError());
@@ -1066,8 +1093,7 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  av_init_packet(&flush_pkt);
-  flush_pkt.data = "FLUSH";
+
   
   for(;;) {
     double incr, pos;
@@ -1077,16 +1103,12 @@ int main(int argc, char *argv[]) {
       case SDL_KEYDOWN:
       switch(event.key.keysym.sym) {
         case SDLK_LEFT:
+          printf("left key pressed\n");
           incr = -10.0;
           goto do_seek;
         case SDLK_RIGHT:
+          printf("right key pressed\n");
           incr = 10.0;
-          goto do_seek;
-        case SDLK_UP:
-          incr = 60.0;
-          goto do_seek;
-        case SDLK_DOWN:
-          incr = -60.0;
           goto do_seek;
         do_seek:
           if(global_video_state) {
@@ -1096,7 +1118,7 @@ int main(int argc, char *argv[]) {
           }
           break;
         default:
-	        break;
+          break;
       }
       break;
     case FF_QUIT_EVENT:
